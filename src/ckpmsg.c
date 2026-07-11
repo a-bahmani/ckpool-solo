@@ -88,7 +88,7 @@ static struct option long_options[] = {
 	{"help",	no_argument,		0,	'h'},
 	{"loglevel",	required_argument,	0,	'l'},
 	{"name",	required_argument,	0,	'n'},
-	{"sockname",	required_argument,	0,	'N'},
+	{"sockname",	required_argument,	0,	'S'},
 	{"proxy",	no_argument,		0,	'p'},
 	{"sockdir",	required_argument,	0,	's'},
 	{"timeout1",	required_argument,	0,	't'},
@@ -183,7 +183,7 @@ out:
 int main(int argc, char **argv)
 {
 	char *name = NULL, *socket_dir = NULL, *buf = NULL, *sockname = "listener";
-	bool proxy = false, counter = false;
+	bool proxy = false, counter = false, cli_msgs = false;
 	int tmo1 = RECV_UNIX_TIMEOUT1;
 	int tmo2 = RECV_UNIX_TIMEOUT2;
 	struct sigaction handler;
@@ -192,7 +192,7 @@ int main(int argc, char **argv)
 
 	tcgetattr(STDIN_FILENO, &oldctrl);
 
-	while ((c = getopt_long(argc, argv, "chl:N:n:ps:t:T:", long_options, &i)) != -1) {
+	while ((c = getopt_long(argc, argv, "chl:n:N:ps:S:t:T:", long_options, &i)) != -1) {
 		switch(c) {
 			/* You'd normally disable most logmsg with -l 3 to
 			 * only see the counter */
@@ -228,8 +228,9 @@ int main(int argc, char **argv)
 				}
 				break;
 			/* Allows us to specify which process or socket to
-			 * talk to. */
+			 * talk to. Accept -N as a legacy alias for -S. */
 			case 'N':
+			case 'S':
 				sockname = strdup(optarg);
 				break;
 			case 'n':
@@ -247,6 +248,9 @@ int main(int argc, char **argv)
 			case 'T':
 				tmo2 = atoi(optarg);
 				break;
+			case '?':
+			default:
+				exit(1);
 		}
 	}
 	if (!socket_dir)
@@ -273,15 +277,25 @@ int main(int argc, char **argv)
 	sigaction(SIGKILL, &handler, NULL);
 	sigaction(SIGHUP, &handler, NULL);
 
+	/* Remaining argv are one-shot messages (e.g. ckpmsg hashrate) */
+	cli_msgs = (optind < argc);
+
 	count = 0;
 	while (42) {
 		struct input_log *log_entry;
 		int sockd, len;
 		char *buf2;
 
-		len = get_line(&buf);
-		if (len == -1)
-			break;
+		if (cli_msgs) {
+			if (optind >= argc)
+				break;
+			buf = strdup(argv[optind++]);
+			len = strlen(buf);
+		} else {
+			len = get_line(&buf);
+			if (len == -1)
+				break;
+		}
 		mkstamp(stamp, sizeof(stamp));
 		if (len < 1) {
 			LOGERR("%s No message", stamp);

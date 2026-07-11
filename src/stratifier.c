@@ -1501,8 +1501,13 @@ retry:
 		LOGDEBUG("Default witness commitment present, adding witness data");
 		gbt_witness_data(wb, txn_array);
 		// Verify against the pre-calculated value if it exists. Skip the size/OP_RETURN bytes.
-		if (wb->insert_witness && safecmp(witnessdata_check + 4, wb->witnessdata) != 0)
-			LOGERR("Witness from btcd: %s. Calculated Witness: %s", witnessdata_check + 4, wb->witnessdata);
+		if (wb->insert_witness && safecmp(witnessdata_check + 4, wb->witnessdata) != 0) {
+			LOGERR("Witness from btcd: %s. Calculated Witness: %s",
+			       witnessdata_check + 4, wb->witnessdata);
+			/* Prefer bitcoind's commitment so solved blocks remain valid */
+			snprintf(wb->witnessdata, sizeof(wb->witnessdata), "%s",
+				 witnessdata_check + 4);
+		}
 	}
 
 	generate_coinbase(ckp, wb);
@@ -5754,8 +5759,10 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	ts_t ts_now;
 	bool ret;
 
-	/* Submit anything over 99.9% of the diff in case of rounding errors */
-	network_diff = sdata->current_workbase->network_diff * 0.999;
+	/* Submit anything over 99.9% of the diff in case of rounding errors.
+	 * Use this share's workbase network_diff, not the current tip's, so a
+	 * valid solve on a previous template is not missed after a retarget. */
+	network_diff = wb->network_diff * 0.999;
 	if (likely(diff < network_diff))
 		return;
 
@@ -6166,7 +6173,7 @@ no_stale:
 out_submit:
 	if (sdiff >= wdiff)
 		submit = true;
-	if (unlikely(sdiff >= sdata->current_workbase->network_diff)) {
+	if (unlikely(sdiff >= wb->network_diff)) {
 		/* Make sure we always submit any possible block solve */
 		LOGWARNING("Submitting possible block solve share diff %lf !", sdiff);
 		submit = true;

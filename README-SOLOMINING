@@ -114,12 +114,12 @@ You can define a signature to be mined into any blocks you solved as follows:
 
 
 You may wish to enable a donation to the author of ckpool with any blocks found
-as a percentage (such as 0.5%) as follows:
+as an integer percentage (1 to 10) as follows:
 
-"donation" : 0.5,
+"donrate" : 1,
 
 Donation is completely optional and disabled by default, but most appreciated.
-0.5% would be a reasonable value.
+1% would be a reasonable value.
 
 
 By default ckpool binds to every local IP address on the hardware it's run on,

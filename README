@@ -250,13 +250,16 @@ pool specified in the configuration file and then reconnect miners to mine with
 their chosen username/password to the upstream pool.
 
 
-ckpmsg and notifier support the -n, -p and -s options
+ckpmsg and notifier support the -n, -p and -s options. ckpmsg also accepts
+-S/--sockname (with -N as a legacy alias) and optional one-shot messages as
+remaining arguments, e.g. ckpmsg -s /tmp -S stratifier hashrate.
 
 ---
 CONFIGURATION
 
-At least one bitcoind is mandatory in ckpool mode with the minimum requirements
-of server, rpcuser and rpcpassword set.
+At least one bitcoind is mandatory in ckpool mode. Each btcd entry needs a
+url, and either auth+pass (rpcuser/rpcpassword) or a cookie file path for
+authentication.
 
 Ckpool takes a json encoded configuration file in ckpool.conf by default or
 ckproxy.conf in proxy or passthrough mode unless specified with -c. Sample
@@ -266,7 +269,8 @@ The options recognised are as follows:
 
 
 "btcd" : This is an array of bitcoind(s) with the options url, auth  and pass
-which match the configured bitcoind. The optional boolean field notify tells
+which match the configured bitcoind. Instead of auth/pass you may set cookie
+to the path of bitcoind's .cookie file. The optional boolean field notify tells
 ckpool this btcd is using the notifier and does not need to be polled for block
 changes. If no btcd is specified, ckpool will look for one on localhost:8332
 with the username "user" and password "pass".
