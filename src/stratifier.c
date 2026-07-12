@@ -6296,6 +6296,10 @@ out_nowb:
 	json_object_set(val, "reject-reason", json_object_get(json_msg, "reject-reason"));
 	json_object_set(val, "error", *err_val);
 	json_set_int(val, "errn", err);
+	if (ckp->logshares || ckp->remote) {
+		ts_realtime(&now);
+		sprintf(cdfield, "%lu,%lu", (unsigned long)now.tv_sec, (unsigned long)now.tv_nsec);
+	}
 	json_set_string(val, "createdate", cdfield);
 	json_set_string(val, "createby", "code");
 	json_set_string(val, "createcode", __func__);
@@ -6306,8 +6310,6 @@ out_nowb:
         json_set_string(val, "agent", client->useragent);
 
 	if (ckp->logshares) {
-		ts_realtime(&now);
-		sprintf(cdfield, "%lu,%lu", (unsigned long)now.tv_sec, (unsigned long)now.tv_nsec);
 		fp = fopen(fname, "ae");
 		if (likely(fp)) {
 			s = json_dumps(val, JSON_EOL);
