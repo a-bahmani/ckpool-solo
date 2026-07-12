@@ -144,6 +144,11 @@ struct user_instance {
 	int txnlen;
 	struct userwb *userwbs; /* Protected by instance lock */
 
+	/* Solo mining cache to avoid per-share userwb lookups */
+	int64_t cached_userwb_id;
+	const uchar *cached_coinb2bin;
+	int cached_coinb2len;
+
 	double best_diff; /* Best share found by this user */
 	int64_t best_ever; /* Best share ever found by this user */
 
@@ -758,6 +763,11 @@ static void clear_userwb(sdata_t *sdata, int64_t id)
 		if (!userwb)
 			continue;
 		HASH_DEL(instance->userwbs, userwb);
+		if (instance->cached_userwb_id == id) {
+			instance->cached_userwb_id = 0;
+			instance->cached_coinb2bin = NULL;
+			instance->cached_coinb2len = 0;
+		}
 		free(userwb->coinb2bin);
 		free(userwb->coinb2);
 		free(userwb);
@@ -993,8 +1003,12 @@ static void __generate_userwb(sdata_t *sdata, workbase_t *wb, user_instance_t *u
 
 	/* Make sure this user doesn't have this userwb already */
 	HASH_FIND_I64(user->userwbs, &id, userwb);
-	if (unlikely(userwb))
+	if (unlikely(userwb)) {
+		user->cached_userwb_id = id;
+		user->cached_coinb2bin = userwb->coinb2bin;
+		user->cached_coinb2len = userwb->coinb2len;
 		return;
+	}
 
 	sdata->userwbs_generated++;
 	userwb = ckzalloc(sizeof(struct userwb));
@@ -1009,6 +1023,9 @@ static void __generate_userwb(sdata_t *sdata, workbase_t *wb, user_instance_t *u
 	userwb->coinb2len += wb->coinb3len;
 	userwb->coinb2 = bin2hex(userwb->coinb2bin, userwb->coinb2len);
 	HASH_ADD_I64(user->userwbs, id, userwb);
+	user->cached_userwb_id = id;
+	user->cached_coinb2bin = userwb->coinb2bin;
+	user->cached_coinb2len = userwb->coinb2len;
 }
 
 static void generate_userwbs(sdata_t *sdata, workbase_t *wb)
@@ -4693,7 +4710,8 @@ static void *blockupdate(void *arg)
 		ret = generator_getbest(ckp, hash);
 		switch (ret) {
 			case GETBEST_NOTIFY:
-				cksleep_ms(5000);
+				/* Block updates handled by ZMQ or blocknotify */
+				cksleep_ms(60000);
 				break;
 			case GETBEST_SUCCESS:
 				if (strcmp(hash, sdata->lastswaphash)) {
@@ -4707,6 +4725,21 @@ static void *blockupdate(void *arg)
 		}
 	}
 	return NULL;
+}
+
+static bool need_blockpoll_thread(ckpool_t *ckp)
+{
+	int i;
+
+#ifdef HAVE_ZMQ_H
+	if (ckp->zmqblock && ckp->zmqblock[0])
+		return false;
+#endif
+	for (i = 0; i < ckp->btcds; i++) {
+		if (!ckp->btcdnotify[i])
+			return true;
+	}
+	return false;
 }
 
 /* Enter holding workbase_lock and client a ref count. */
@@ -5819,7 +5852,7 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	json_decref(val);
 }
 
-/* Entered with instance_lock held */
+/* Entered with instance_lock held for solo userwb lookup */
 static inline uchar *__user_coinb2(const stratum_instance_t *client, const workbase_t *wb, int *cb2len)
 {
 	struct userwb *userwb;
@@ -5838,6 +5871,38 @@ static inline uchar *__user_coinb2(const stratum_instance_t *client, const workb
 out_nouserwb:
 	*cb2len = wb->coinb2len;
 	return wb->coinb2bin;
+}
+
+static inline void __coinb2_for_share(const stratum_instance_t *client, const workbase_t *wb,
+				      uchar **coinb2bin, int *cb2len)
+{
+	user_instance_t *user;
+
+	if (!client->ckp->btcsolo) {
+		*cb2len = wb->coinb2len;
+		*coinb2bin = wb->coinb2bin;
+		return;
+	}
+
+	user = client->user_instance;
+	if (likely(user->cached_userwb_id == wb->id && user->cached_coinb2bin)) {
+		*cb2len = user->cached_coinb2len;
+		*coinb2bin = (uchar *)user->cached_coinb2bin;
+		return;
+	}
+
+	ck_rlock(&client->sdata->instance_lock);
+	*coinb2bin = __user_coinb2(client, wb, cb2len);
+	if (*coinb2bin != wb->coinb2bin) {
+		user->cached_userwb_id = wb->id;
+		user->cached_coinb2bin = *coinb2bin;
+		user->cached_coinb2len = *cb2len;
+	} else {
+		user->cached_userwb_id = 0;
+		user->cached_coinb2bin = NULL;
+		user->cached_coinb2len = 0;
+	}
+	ck_runlock(&client->sdata->instance_lock);
 }
 
 /* Needs to be entered with workbase readcount and client holding a ref count. */
@@ -5863,12 +5928,8 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 	cblen += wb->enonce1constlen + wb->enonce1varlen;
 	hex2bin(coinbase + cblen, nonce2, wb->enonce2varlen);
 	cblen += wb->enonce2varlen;
-
-	ck_rlock(&sdata->instance_lock);
-	coinb2bin = __user_coinb2(client, wb, &cb2len);
+	__coinb2_for_share(client, wb, &coinb2bin, &cb2len);
 	memcpy(coinbase + cblen, coinb2bin, cb2len);
-	ck_runlock(&sdata->instance_lock);
-
 	cblen += cb2len;
 
 	gen_hash((uchar *)coinbase, merkle_root, cblen);
@@ -5921,7 +5982,7 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 /* Optimised for the common case where shares are new */
 static bool new_share(sdata_t *sdata, const uchar *hash, const int64_t wb_id)
 {
-	share_t *share = ckzalloc(sizeof(share_t)), *match = NULL;
+	share_t *share = ckalloc(sizeof(share_t)), *match = NULL;
 	bool ret = true;
 
 	memcpy(share->hash, hash, 32);
@@ -6007,7 +6068,7 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
 	bool share = false, result = false, invalid = true, submit = false, stale = false;
 	const char *workername, *job_id, *ntime, *version_mask;
 	double diff = client->diff, wdiff = 0, sdiff = -1;
-	char hexhash[68] = {}, sharehash[32], cdfield[64];
+	char hexhash[68] = {}, sharehash[32], cdfield[64] = {};
 	user_instance_t *user = client->user_instance;
 	char *fname = NULL, *s, *nonce, *nonce2;
 	uint32_t ntime32, version_mask32 = 0;
@@ -6023,10 +6084,6 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
 	int64_t id;
 	ts_t now;
 	FILE *fp;
-
-	ts_realtime(&now);
-	now_t = now.tv_sec;
-	sprintf(cdfield, "%lu,%lu", now.tv_sec, now.tv_nsec);
 
 	if (unlikely(!json_is_array(params_val))) {
 		err = SE_NOT_ARRAY;
@@ -6150,6 +6207,7 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
 			int latency;
 			tv_t now_tv;
 
+			ts_realtime(&now);
 			ts_to_tv(&now_tv, &now);
 			latency = ms_tvdiff(&now_tv, &wb->retired);
 			if (latency < client->latency) {
@@ -6248,6 +6306,8 @@ out_nowb:
         json_set_string(val, "agent", client->useragent);
 
 	if (ckp->logshares) {
+		ts_realtime(&now);
+		sprintf(cdfield, "%lu,%lu", (unsigned long)now.tv_sec, (unsigned long)now.tv_nsec);
 		fp = fopen(fname, "ae");
 		if (likely(fp)) {
 			s = json_dumps(val, JSON_EOL);
@@ -6264,6 +6324,7 @@ out_nowb:
 		upstream_json_msgtype(ckp, val, SM_SHARE);
 	json_decref(val);
 out:
+	now_t = time(NULL);
 	if (!sdata->wbincomplete && ((!result && !submit) || !share)) {
 		/* Is this the first in a run of invalids? */
 		if (client->first_invalid < client->last_share.tv_sec || !client->first_invalid)
@@ -8598,11 +8659,12 @@ void *stratifier(void *arg)
 
 	cklock_init(&sdata->txn_lock);
 	cklock_init(&sdata->workbase_lock);
-	if (!ckp->proxy)
+	if (need_blockpoll_thread(ckp))
 		create_pthread(&pth_blockupdate, blockupdate, ckp);
-	else {
+	else if (!ckp->proxy)
+		LOGNOTICE("Block polling thread disabled; using ZMQ/blocknotify");
+	if (ckp->proxy)
 		mutex_init(&sdata->proxy_lock);
-	}
 
 	mutex_init(&sdata->stats_lock);
 	mutex_init(&sdata->uastats_lock);
