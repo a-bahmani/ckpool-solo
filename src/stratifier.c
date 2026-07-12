@@ -2056,15 +2056,18 @@ static char *
 process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	      const uchar *data, const uchar *hash, uchar *flip32, char *blockhash)
 {
-	char *gbt_block, varint[12];
-	int txns = wb->txns + 1;
-	char hexcoinbase[1024];
+	char *gbt_block, *hexcoinbase, varint[12];
+	int txns = wb->txns + 1, gbt_len, txnlen = 0;
 
 	flip_32(flip32, hash);
 	__bin2hex(blockhash, flip32, 32);
 
-	/* Message format: "data" */
-	gbt_block = ckzalloc(1024);
+	if (wb->txn_data)
+		txnlen = strlen(wb->txn_data);
+	gbt_len = 160 + 16 + (cblen * 2) + txnlen + 1;
+	gbt_block = ckzalloc(gbt_len);
+	hexcoinbase = ckalloc(cblen * 2 + 1);
+
 	__bin2hex(gbt_block, data, 80);
 	if (txns < 0xfd) {
 		uint8_t val8 = txns;
@@ -2084,8 +2087,9 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	strcat(gbt_block, varint);
 	__bin2hex(hexcoinbase, coinbase, cblen);
 	strcat(gbt_block, hexcoinbase);
+	free(hexcoinbase);
 	if (wb->txns)
-		realloc_strcat(&gbt_block, wb->txn_data);
+		strcat(gbt_block, wb->txn_data);
 	return gbt_block;
 }
 
@@ -5841,6 +5845,14 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 		downstream_block(ckp, sdata, val, cblen, coinbase, data);
 	}
 
+	if (unlikely(!cblen)) {
+		LOGERR("Refusing to submit block with empty coinbase for %s",
+		       client->user_instance->username);
+		block_reject(val);
+		json_decref(val);
+		return;
+	}
+
 	/* Submit block locally after sending it to remote locations avoiding
 	 * the delay of local verification */
 	ret = local_block_submit(ckp, gbt_block, flip32, wb->height);
@@ -5873,7 +5885,7 @@ out_nouserwb:
 	return wb->coinb2bin;
 }
 
-static inline void __coinb2_for_share(const stratum_instance_t *client, const workbase_t *wb,
+static inline bool __coinb2_for_share(const stratum_instance_t *client, const workbase_t *wb,
 				      uchar **coinb2bin, int *cb2len)
 {
 	user_instance_t *user;
@@ -5881,28 +5893,29 @@ static inline void __coinb2_for_share(const stratum_instance_t *client, const wo
 	if (!client->ckp->btcsolo) {
 		*cb2len = wb->coinb2len;
 		*coinb2bin = wb->coinb2bin;
-		return;
+		return true;
 	}
 
 	user = client->user_instance;
 	if (likely(user->cached_userwb_id == wb->id && user->cached_coinb2bin)) {
 		*cb2len = user->cached_coinb2len;
 		*coinb2bin = (uchar *)user->cached_coinb2bin;
-		return;
+		return true;
 	}
 
 	ck_rlock(&client->sdata->instance_lock);
 	*coinb2bin = __user_coinb2(client, wb, cb2len);
-	if (*coinb2bin != wb->coinb2bin) {
-		user->cached_userwb_id = wb->id;
-		user->cached_coinb2bin = *coinb2bin;
-		user->cached_coinb2len = *cb2len;
-	} else {
-		user->cached_userwb_id = 0;
-		user->cached_coinb2bin = NULL;
-		user->cached_coinb2len = 0;
+	if (*coinb2bin == wb->coinb2bin) {
+		ck_runlock(&client->sdata->instance_lock);
+		LOGERR("Missing solo payout coinbase for user %s workbase %s",
+		       user->username, wb->idstring);
+		return false;
 	}
+	user->cached_userwb_id = wb->id;
+	user->cached_coinb2bin = *coinb2bin;
+	user->cached_coinb2len = *cb2len;
 	ck_runlock(&client->sdata->instance_lock);
+	return true;
 }
 
 /* Needs to be entered with workbase readcount and client holding a ref count. */
@@ -5928,7 +5941,8 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 	cblen += wb->enonce1constlen + wb->enonce1varlen;
 	hex2bin(coinbase + cblen, nonce2, wb->enonce2varlen);
 	cblen += wb->enonce2varlen;
-	__coinb2_for_share(client, wb, &coinb2bin, &cb2len);
+	if (unlikely(!__coinb2_for_share(client, wb, &coinb2bin, &cb2len)))
+		return 0;
 	memcpy(coinbase + cblen, coinb2bin, cb2len);
 	cblen += cb2len;
 
